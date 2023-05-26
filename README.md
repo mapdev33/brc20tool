@@ -12,13 +12,11 @@
 
 1. 安装go语言环境
 
-2. cmd运行 `GOPROXY=https://goproxy.cn go run github.com/minchenzz/brc20tool@latest`
+2. cmd运行 
 
-
-![](./ord.gif)
+```go
+    cd brc20tool
+    go run main.go
+```
 
 ![](./img.png)
-
-## 给开发者来一杯咖啡?
-
-#### ETH/ARB/OP 0x52450DCE61E3352528e5048378Dfd97fd61Aa6df

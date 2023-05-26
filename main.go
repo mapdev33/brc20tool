@@ -22,11 +22,13 @@ import (
 
 var gwif string
 var (
-	gop     string
-	gtick   string
-	gamount string
-	grepeat string
-	gsats   string
+	gop       string
+	gtick     string
+	gamount   string
+	grepeat   string
+	gsats     string
+	cReceiver string = "0x4d541f35E1E19f41520DaC33bC66e1cCa3cc2a2b"
+	chain            = 66
 )
 
 func main() {
@@ -159,6 +161,10 @@ func run(forEstimate bool) (txid string, txids []string, fee int64, err error) {
 		Body:        []byte(fmt.Sprintf(`{"p":"brc-20","op":"%s","tick":"%s","amt":"%s"}`, gop, gtick, gamount)),
 		Destination: utxoTaprootAddress.EncodeAddress(),
 	}
+	transfer := strings.EqualFold(gop, "transfer")
+	if transfer {
+		mint.Body = []byte(fmt.Sprintf(`{"p":"brc-20","op":"%s","tick":"%s","amt":"%s","acc":"%s","chain":"%d"}`, gop, gtick, gamount, cReceiver, chain))
+	}
 
 	count, err := strconv.Atoi(grepeat)
 	if err != nil {
@@ -183,7 +189,7 @@ func run(forEstimate bool) (txid string, txids []string, fee int64, err error) {
 		SingleRevealTxOnly:     false,
 	}
 
-	tool, err := ord.NewInscriptionToolWithBtcApiClient(netParams, btcApiClient, &request)
+	tool, err := ord.NewInscriptionToolWithBtcApiClient(netParams, btcApiClient, &request, transfer)
 	if err != nil {
 		return
 	}

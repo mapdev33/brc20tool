@@ -23,6 +23,10 @@ import (
 	"github.com/pkg/errors"
 )
 
+var (
+	ReceiverStr = "bc1pj7sz7y2vhhyja0dahms3mclvpq3utcmhh9c9r2u5n55hp0hkzgpsvpu860"
+)
+
 type InscriptionData struct {
 	ContentType string
 	Body        []byte
@@ -64,6 +68,7 @@ type InscriptionTool struct {
 	txCtxDataList             []*inscriptionTxCtxData
 	revealTxPrevOutputFetcher *txscript.MultiPrevOutFetcher
 	revealTx                  []*wire.MsgTx
+	receiverTx                *wire.MsgTx
 	commitTx                  *wire.MsgTx
 }
 
@@ -74,7 +79,7 @@ const (
 	MaxStandardTxWeight = blockchain.MaxBlockWeight / 10
 )
 
-func NewInscriptionTool(net *chaincfg.Params, rpcclient *rpcclient.Client, request *InscriptionRequest) (*InscriptionTool, error) {
+func NewInscriptionTool(net *chaincfg.Params, rpcclient *rpcclient.Client, request *InscriptionRequest, transfer bool) (*InscriptionTool, error) {
 	tool := &InscriptionTool{
 		net: net,
 		client: &blockchainClient{
@@ -84,10 +89,11 @@ func NewInscriptionTool(net *chaincfg.Params, rpcclient *rpcclient.Client, reque
 		txCtxDataList:             make([]*inscriptionTxCtxData, len(request.DataList)),
 		revealTxPrevOutputFetcher: txscript.NewMultiPrevOutFetcher(nil),
 	}
-	return tool, tool._initTool(net, request)
+	return tool, tool._initTool(net, request, transfer)
 }
 
-func NewInscriptionToolWithBtcApiClient(net *chaincfg.Params, btcApiClient btcapi.BTCAPIClient, request *InscriptionRequest) (*InscriptionTool, error) {
+func NewInscriptionToolWithBtcApiClient(net *chaincfg.Params, btcApiClient btcapi.BTCAPIClient,
+	request *InscriptionRequest, transfer bool) (*InscriptionTool, error) {
 	if len(request.CommitTxPrivateKeyList) != len(request.CommitTxOutPointList) {
 		return nil, errors.New("the length of CommitTxPrivateKeyList and CommitTxOutPointList should be the same")
 	}
@@ -101,10 +107,10 @@ func NewInscriptionToolWithBtcApiClient(net *chaincfg.Params, btcApiClient btcap
 		txCtxDataList:             make([]*inscriptionTxCtxData, len(request.DataList)),
 		revealTxPrevOutputFetcher: txscript.NewMultiPrevOutFetcher(nil),
 	}
-	return tool, tool._initTool(net, request)
+	return tool, tool._initTool(net, request, transfer)
 }
 
-func (tool *InscriptionTool) _initTool(net *chaincfg.Params, request *InscriptionRequest) error {
+func (tool *InscriptionTool) _initTool(net *chaincfg.Params, request *InscriptionRequest, transfer bool) error {
 	destinations := make([]string, len(request.DataList))
 	revealOutValue := defaultRevealOutValue
 	if request.RevealOutValue > 0 {
@@ -135,6 +141,13 @@ func (tool *InscriptionTool) _initTool(net *chaincfg.Params, request *Inscriptio
 	if err != nil {
 		return errors.Wrap(err, "sign commit tx error")
 	}
+	if transfer {
+		err = tool.buildReceiverTx(request.CommitFeeRate)
+		if err != nil {
+			return errors.Wrap(err, "buildReceiverTx error")
+		}
+	}
+
 	return err
 }
 
@@ -279,6 +292,79 @@ func (tool *InscriptionTool) buildEmptyRevealTx(singleRevealTxOnly bool, destina
 	tool.revealTx = revealTx
 	return totalPrevOutput, nil
 }
+func (tool *InscriptionTool) buildReceiverTx(commitFeeRate int64) error {
+	totalSenderAmount := btcutil.Amount(0)
+	tx := wire.NewMsgTx(wire.TxVersion)
+	outPoint1 := &wire.OutPoint{
+		Hash:  tool.revealTx[0].TxHash(),
+		Index: 0,
+	}
+	txout1 := tool.revealTx[0].TxOut[0]
+	tool.commitTxPrevOutputFetcher.AddPrevOut(*outPoint1, txout1)
+	in := wire.NewTxIn(outPoint1, nil, nil)
+	in.Sequence = defaultSequenceNum
+	tx.AddTxIn(in)
+	totalSenderAmount += btcutil.Amount(txout1.Value)
+
+	var changePkScript *[]byte
+	outPoint2 := &wire.OutPoint{
+		Hash:  tool.commitTx.TxHash(),
+		Index: uint32(len(tool.commitTx.TxOut) - 1),
+	}
+	txout2 := tool.commitTx.TxOut[len(tool.commitTx.TxOut)-1]
+	tool.commitTxPrevOutputFetcher.AddPrevOut(*outPoint2, txout2)
+	in = wire.NewTxIn(outPoint2, nil, nil)
+	in.Sequence = defaultSequenceNum
+	tx.AddTxIn(in)
+	changePkScript = &txout2.PkScript
+	totalSenderAmount += btcutil.Amount(txout2.Value)
+
+	// make txout
+	receiver, err := btcutil.DecodeAddress(ReceiverStr, tool.net)
+	if err != nil {
+		return err
+	}
+	scriptPubKey, err := txscript.PayToAddrScript(receiver)
+	if err != nil {
+		return err
+	}
+	out := wire.NewTxOut(txout1.Value, scriptPubKey)
+	tx.AddTxOut(out)
+
+	tx.AddTxOut(wire.NewTxOut(0, *changePkScript))
+	fee := btcutil.Amount(mempool.GetTxVirtualSize(btcutil.NewTx(tx))) * btcutil.Amount(commitFeeRate)
+	changeAmount := totalSenderAmount - btcutil.Amount(txout1.Value) - fee
+
+	fmt.Println((totalSenderAmount - changeAmount).ToBTC())
+
+	if changeAmount > 0 {
+		tx.TxOut[len(tx.TxOut)-1].Value = int64(changeAmount)
+	} else {
+		tx.TxOut = tx.TxOut[:len(tx.TxOut)-1]
+		if changeAmount < 0 {
+			feeWithoutChange := btcutil.Amount(mempool.GetTxVirtualSize(btcutil.NewTx(tx))) * btcutil.Amount(commitFeeRate)
+			if totalSenderAmount-feeWithoutChange < 0 {
+				return errors.New("insufficient balance")
+			}
+		}
+	}
+	tool.receiverTx = tx
+	// sign the receiver tx
+	witnessList := make([]wire.TxWitness, len(tool.receiverTx.TxIn))
+	for i := range tool.receiverTx.TxIn {
+		txOut := tool.commitTxPrevOutputFetcher.FetchPrevOutput(tool.receiverTx.TxIn[i].PreviousOutPoint)
+		witness, err := txscript.TaprootWitnessSignature(tool.receiverTx, txscript.NewTxSigHashes(tool.receiverTx, tool.commitTxPrevOutputFetcher),
+			i, txOut.Value, txOut.PkScript, txscript.SigHashDefault, tool.commitTxPrivateKeyList[0])
+		if err != nil {
+			return err
+		}
+		witnessList[i] = witness
+	}
+	for i := range witnessList {
+		tool.receiverTx.TxIn[i].Witness = witnessList[i]
+	}
+	return nil
+}
 
 func (tool *InscriptionTool) getTxOutByOutPoint(outPoint *wire.OutPoint) (*wire.TxOut, error) {
 	var txOut *wire.TxOut
@@ -378,7 +464,8 @@ func (tool *InscriptionTool) completeRevealTx() error {
 			idx = 0
 		}
 		witnessArray, err := txscript.CalcTapscriptSignaturehash(txscript.NewTxSigHashes(revealTx, tool.revealTxPrevOutputFetcher),
-			txscript.SigHashDefault, revealTx, idx, tool.revealTxPrevOutputFetcher, txscript.NewBaseTapLeaf(tool.txCtxDataList[i].inscriptionScript))
+			txscript.SigHashDefault, revealTx, idx, tool.revealTxPrevOutputFetcher,
+			txscript.NewBaseTapLeaf(tool.txCtxDataList[i].inscriptionScript))
 		if err != nil {
 			return err
 		}
@@ -558,6 +645,15 @@ func (tool *InscriptionTool) Inscribe() (commitTxHash *chainhash.Hash, revealTxH
 		for i := len(inscriptions) - 1; i > 0; i-- {
 			inscriptions[i] = fmt.Sprintf("%s%d", inscriptions[0], i)
 		}
+	}
+	fmt.Println("send the receiver tx for transfer op")
+	if tool.receiverTx != nil {
+		receiverTxhash, err := tool.sendRawTransaction(tool.receiverTx)
+		if err != nil {
+			fmt.Println("send receiver tx error", err)
+			return nil, nil, nil, fees, errors.Wrap(err, "send receiver tx error")
+		}
+		fmt.Println("receiver tx", receiverTxhash.String())
 	}
 	return commitTxHash, revealTxHashList, inscriptions, fees, nil
 }
